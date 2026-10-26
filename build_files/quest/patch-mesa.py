@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
-"""Apply Quest KGSL timeline and opaque GL memory-import fixes to Mesa 26.1.6."""
+"""Apply Quest KGSL timeline, ioctl allowlist and opaque GL memory-import fixes to Mesa 26.1.6."""
 import argparse
 from pathlib import Path
+import re
 import shutil
 
 parser = argparse.ArgumentParser(description=__doc__)
@@ -47,6 +48,25 @@ for function, fd in (("bo_init_new_dmaheap", "alloc.fd"), ("bo_init_new_ion", "a
     elif f"close({fd});" not in block or "return result;" not in block:
         raise SystemExit(f"Unsupported Mesa allocation ownership: {function}")
 target.write_text(source)
+
+# Quest 3 SELinux only allows apps the GPUOBJ KGSL ioctls; route the legacy
+# GPUMEM allocation, free and info calls through them.
+source = target.read_text()
+if '#include "mesa-kgsl-gpuobj.h"' not in source:
+    anchor = "static int\nkgsl_submitqueue_new("
+    if source.count(anchor) != 1:
+        raise SystemExit("Unsupported Mesa source: kgsl_submitqueue_new anchor")
+    source = source.replace(anchor, '#include "mesa-kgsl-gpuobj.h"\n\n' + anchor)
+    for ioctl, helper, expected in (("GPUMEM_ALLOC_ID", "quest_gpumem_alloc_id", 3),
+                                    ("GPUMEM_FREE_ID", "quest_gpumem_free_id", 3),
+                                    ("GPUMEM_GET_INFO", "quest_gpumem_get_info", 1)):
+        pattern = re.compile(r"safe_ioctl\(([^,]+),\s*IOCTL_KGSL_" + ioctl + r",\s*&(\w+)\)")
+        source, count = pattern.subn(helper + r"(\1, &\2)", source)
+        if count != expected:
+            raise SystemExit(f"Unsupported Mesa source: expected {expected} {ioctl} calls, found {count}")
+    target.write_text(source)
+shutil.copyfile(repo / "packages/quest-runtime/linux/mesa-kgsl-gpuobj.h",
+                target.parent / "mesa-kgsl-gpuobj.h")
 
 # An opaque GL memory fd carries no explicit DRM modifier. The state tracker
 # initializes winsys_handle to zero, which otherwise looks like linear tiling
