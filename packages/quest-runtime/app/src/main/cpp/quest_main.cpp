@@ -30,6 +30,7 @@
 #include "loading_boost.h"
 #include "hand_tracking.h"
 #include "hand_render.h"
+#include "pose_history.h"
 
 #define LOG(...) __android_log_print(ANDROID_LOG_INFO,"StearlightXR",__VA_ARGS__)
 static void check(XrResult result,const char* name){if(XR_FAILED(result)){LOG("%s failed: %d",name,result);throw std::runtime_error(name);}}
@@ -52,6 +53,9 @@ struct Runtime {
  XrPath hands[2]{};Eye eyes[2],statusEye;XrTime statusUpdated=0;bool running=false,visible=false,focused=false;
  QuestTracking* tracking=nullptr;GLuint framebuffer=0;GpuBridge gpu;VideoBridge video;
  XrView frameViews[2]={{XR_TYPE_VIEW},{XR_TYPE_VIEW}};bool haveFrameViews=false;
+ // files/state/pose-offset re-tags Linux images with a neighbouring sample.
+ quest::PoseHistory poseHistory;int poseOffset=0;timespec poseOffsetStamp{};
+ std::chrono::steady_clock::time_point poseReport{},lastAdopt{};double poseAgeMs=0,poseAgeMax=0,poseGapMax=0,poseBehind=0;unsigned poseFrames=0,poseMissing=0;
  bool eyesDirty=true,lastLoading=true,lastPassthrough=false;
  bool haveStage=false,playSpacePublished=false;
  std::chrono::steady_clock::time_point eyeReport{};double eyeMs=0;unsigned eyeFrames=0;
@@ -240,6 +244,9 @@ struct Runtime {
    }
    handTracking.update(sample,i,physical,stage,state.predictedDisplayTime);
   }handTracking.publish(sample);questPublishTracking(tracking,sample);
+  quest::PoseSample published;published.sequence=__atomic_load_n(&tracking->sequence,__ATOMIC_ACQUIRE);published.predicted_ns=sample.predicted_monotonic_ns;
+  for(int i=0;i<2;i++){memcpy(published.position[i],sample.eyes[i].position,sizeof(published.position[i]));memcpy(published.orientation[i],sample.eyes[i].orientation,sizeof(published.orientation[i]));}
+  poseHistory.record(published);
   publishPlaySpace();
   // Passthrough is a compositor layer; camera pixels never enter Linux.
   if(!bootFinished)bootFinished=bootComplete();
@@ -257,6 +264,11 @@ struct Runtime {
        (request.st_mtim.tv_sec==boostStamp[i].tv_sec&&request.st_mtim.tv_nsec==boostStamp[i].tv_nsec))continue;
     boostStamp[i]=request.st_mtim;double deadline=0;std::ifstream input(path);input>>deadline;
     if(std::isfinite(deadline)&&deadline>boostNow)loadingBoost.request(boostNow,deadline-boostNow);
+   }
+   std::string offsetPath=directory+"/pose-offset";struct stat offsetFile{};
+   if(!stat(offsetPath.c_str(),&offsetFile)&&(offsetFile.st_mtim.tv_sec!=poseOffsetStamp.tv_sec||offsetFile.st_mtim.tv_nsec!=poseOffsetStamp.tv_nsec)){
+    poseOffsetStamp=offsetFile.st_mtim;int value=0;std::ifstream input(offsetPath);
+    if(input>>value){poseOffset=std::max(-16,std::min(16,value));LOG("Linux image pose offset %d samples",poseOffset);}
    }
   }
   bool boost=loadingBoost.update(boostNow,loading,focused&&!cpuThermalLimited);
@@ -288,11 +300,26 @@ struct Runtime {
     for(float value:eye.fov)valid=valid&&std::isfinite(value);
     valid=valid&&eye.fov[0]<eye.fov[1]&&eye.fov[3]<eye.fov[2];
    }
+   const quest::PoseSample* shifted=valid&&poseOffset?poseHistory.find(input.pose_sequence,poseOffset):nullptr;
+   if(valid){
+    // Age: how far the image's pose prediction trails this display time.
+    auto now=std::chrono::steady_clock::now();
+    if(lastAdopt.time_since_epoch().count())poseGapMax=std::max(poseGapMax,std::chrono::duration<double,std::milli>(now-lastAdopt).count());
+    lastAdopt=now;
+    double age=(static_cast<double>(sample.predicted_monotonic_ns)-static_cast<double>(input.predicted_monotonic_ns))*1e-6;
+    poseAgeMs+=age;poseAgeMax=std::max(poseAgeMax,age);++poseFrames;
+    int behind=poseHistory.behind(input.pose_sequence);if(behind<0)++poseMissing;else poseBehind+=behind;
+    if(now-poseReport>=std::chrono::seconds(5)){
+     LOG("Linux image poses: %u frames, age %.1f/%.1f ms avg/max, gap max %.1f ms, tag %.2f samples behind (%u unknown), offset %d",poseFrames,poseAgeMs/poseFrames,poseAgeMax,poseGapMax,poseFrames>poseMissing?poseBehind/(poseFrames-poseMissing):0.,poseMissing,poseOffset);
+     poseReport=now;poseAgeMs=poseAgeMax=poseGapMax=poseBehind=0;poseFrames=poseMissing=0;
+    }
+   }
    for(int eye=0;eye<2;eye++){
     frameViews[eye]=views[eye];
     if(valid){const auto& sampled=input.views[eye];
-     frameViews[eye].pose.position={sampled.position[0],sampled.position[1],sampled.position[2]};
-     frameViews[eye].pose.orientation={sampled.orientation[0],sampled.orientation[1],sampled.orientation[2],sampled.orientation[3]};
+     const float* position=shifted?shifted->position[eye]:sampled.position;const float* orientation=shifted?shifted->orientation[eye]:sampled.orientation;
+     frameViews[eye].pose.position={position[0],position[1],position[2]};
+     frameViews[eye].pose.orientation={orientation[0],orientation[1],orientation[2],orientation[3]};
      frameViews[eye].fov={sampled.fov[0],sampled.fov[1],sampled.fov[2],sampled.fov[3]};
     }
    }haveFrameViews=true;
